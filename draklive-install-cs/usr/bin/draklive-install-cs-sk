@@ -1,0 +1,81 @@
+#! /bin/sh
+
+#################################################################
+# Vytvořeno pro české vydání PCLinuxOSu 2010
+# Created for the Czech edition of PCLinuxOS 2010
+# od / by Migelo
+#################################################################
+
+
+ 
+xdli=/tmp/xdli
+
+if [ ! -e $xdli ];then
+  if [ -r /usr/bin/gksu ]; then WMSUDO=/usr/bin/gksu; fi
+  if [ -r /usr/lib/kde4/libexec/kdesu ]; then WMSUDO=/usr/lib/kde4/libexec/kdesu; fi
+  if [ -r /usr/bin/kdesu ]; then WMSUDO=/usr/bin/kdesu; fi
+  echo "#"'!/bin/bash' > $xdli
+  if [ "$UID" != "0" ]; then echo $WMSUDO draklive-install-cs-sk >> $xdli; else echo draklive-install-cs-sk >> $xdli; fi
+  chmod a+x $xdli
+  $xdli &
+  exit 0
+fi
+
+if [ "$UID" != "0" ]; then
+  $xdli &
+  exit 0
+fi
+
+export MAIN_DIALOG='
+
+<window title="Výběr jazyka" window_position="1" width_request="300" heigth_request="300">
+<vbox>
+
+<text><label>" "</label></text>
+
+    <text wrap="true" use-markup="true">
+	<label>"<span font-family='"'dejavu'"' weight='"'bold'"' size='"'large'"'>Vyberte jazyk</span>"</label>
+    </text>
+
+<hbox homogeneous="true">
+	<frame>
+	    <pixmap>
+		<input file>/usr/share/pclinuxos/pics/cz.png</input>
+	    </pixmap>
+	    <button>
+		<label>"Nainstalovat"</label>
+		<action>/usr/sbin/draklive-install-cs</action>
+		<action type="exit">exit 0</action>
+	    </button>
+	</frame>
+
+	<frame>
+	    <pixmap>
+		<input file>/usr/share/pclinuxos/pics/sk.png</input>
+	    </pixmap>
+	    <button>
+		<label>"Nainštalovať"</label>
+		<action>/usr/bin/slovensky-install</action>
+		<action>env LANGUAGE=sk /usr/sbin/draklive-install-sk</action>
+		<action type="exit">exit 0</action>
+	    </button>
+	</frame>
+</hbox>
+
+<hbox>
+      <button>
+        <input file>/usr/share/pclinuxos/pics/exit.png</input>
+	    <label>"Zrušit  "</label>
+	    <action type="exit">exit 0</action>
+      </button>
+</hbox>
+
+</vbox>
+
+</window>
+'
+
+gtkdialog --program=MAIN_DIALOG
+
+/bin/rm -f $xdli
+exit 0

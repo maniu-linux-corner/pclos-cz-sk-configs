@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Firewall Setup
+Name[cs]=Nastavení firewallu
+Name[sk]=Natavenie Firewallu
+Exec=/usr/sbin/drakfirewall
+Icon=/usr/share/mcc/themes/default/firewall-mdk.png
+Type=Application
+Categories=System;Network;X-MandrivaLinux-System-Configuration;Settings;
+StartupNotify=true

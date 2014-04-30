@@ -1,0 +1,11 @@
+[Desktop Entry]
+Encoding=UTF-8
+Name=Install PCLinuxOS
+Name[cs]=Nainstalovat PCLinuxOS
+Name[sk]=Nainštalovať PCLinuxOS
+Exec=/usr/bin/draklive-install-cs-sk
+Icon=draklive-install
+Terminal=false
+Type=Application
+StartupNotify=true
+

@@ -1,0 +1,21 @@
+[Desktop Entry]
+Name=Configure Your Computer
+Name[cs]=Nastavit váš počítač
+Name[fr]=Configurer Votre Ordinateur
+Name[nl]=Uw computer configureren
+Name[de]=Konfigurieren Sie Ihren Computer
+Name[sk]=Nastaviť váš počítač
+Name[sv]=Konfigurera din dator
+Name[rs]=Подесите Ваш Рачунар
+Exec=/usr/sbin/drakconf
+Comment=Administration Center
+Comment[fr]=Centre de Gestion du Système
+Comment[nl]=Beheercentrum
+Comment[de]=Administrationszentrale
+Comment[sv]=Inställningscentral
+Comment[rs]=Администрациони Центар
+Icon=drakconf.png
+Terminal=false
+Type=Application
+StartupNotify=true
+Categories=GTK;X-MandrivaLinux-System-Configuration;Settings;

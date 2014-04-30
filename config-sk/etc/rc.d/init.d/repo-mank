@@ -1,0 +1,23 @@
+#!/bin/bash -l
+
+################################################################
+#
+#Popis: Přidání / ověření CZ/SK repozitáře do / v sources.list
+#
+################################################################
+
+arch=`getconf LONG_BIT` 
+if [ $arch -eq 32 ]; then 
+  archadd="i586"
+  else 
+  archadd="x86_64"
+fi
+
+if [ -n "`cat /etc/apt/sources.list | grep " czech-noarch "`" ]; then is=1; else is=0; fi
+
+if [ $is -eq 0 ]; then
+cat <<EOF>> /etc/apt/sources.list
+
+rpm http://mirror.panelnet.cz/pclinuxos/repo/cesky/ pclinuxos/2012 czech-$archadd czech-noarch czech-lo-$archadd
+EOF
+fi

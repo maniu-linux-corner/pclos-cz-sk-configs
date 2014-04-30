@@ -1,0 +1,485 @@
+#!/usr/bin/perl
+
+# Must be done as early as possible to avoid issues when displaying translated
+# strings
+BEGIN {
+    push @::textdomains, 'draklive-install';
+}
+
+use lib qw(/usr/lib/libDrakX);
+use standalone;
+use interactive;
+use fs;
+use fs::any;
+use fs::type;
+use fs::partitioning;
+use fs::partitioning_wizard;
+use partition_table;
+use MDK::Common;
+use common;
+use feature qw(state);
+
+my $conf_file = '/etc/sysconfig/draklive-install';
+my %conf = getVarsFromSh($conf_file);
+
+($::real_windowwidth, $::real_windowheight) = (600, 400);
+
+{
+    use diskdrake::interactive;
+    package diskdrake::interactive;
+    my $old = \&hd_possible_actions_base;
+    undef *hd_possible_actions_base;
+    *hd_possible_actions_base = sub {
+	#- for the partition wizard to show the auto-allocate option
+	local $::isInstall = 1;
+	&$old;
+    };
+    undef *Done;
+    #- skip the fstab/reboot checks
+    *Done = \&diskdrake_interactive_Done;
+    #- don't ask whether to Move/Hide old files
+    undef *need_migration;
+    *need_migration = sub { 'hide' };
+}
+
+install_live();
+
+sub install_live() {
+    my $in = 'interactive'->vnew('su');
+    $in->{pop_wait_messages} = 0;
+
+    $::isWizard = 1;
+    $::Wizard_no_previous = 1;
+    $::Wizard_pix_up = "pclinuxos-wizard";
+
+    my $all_hds = {};
+
+# update fstab hds  UUID for pclos 
+system("/usr/sbin/drakupdate_fstab --verbose --auto --del '$all_hds'");
+system("/usr/sbin/drakupdate_fstab --verbose --auto --add '$all_hds'");
+
+    my $fstab = [];
+    $::prefix = '/mnt/install';
+
+    my $system_file = '/etc/sysconfig/draklive-install';
+    my %settings = getVarsFromSh($system_file);
+
+    my $copy_source = $settings{SOURCE} || '/union';
+    my $live_media = '/union';
+    
+    display_start_message();
+    init_hds($in, $all_hds, $fstab, $live_media);
+    ask_partitions_loop($in, $all_hds, $fstab, $copy_source);
+    prepare_root($in, $all_hds);
+    copy_root($in, $copy_source);
+    complete_install($in, $all_hds);
+    setup_bootloader($in, $all_hds, $fstab);
+    finish_installation($fstab);
+    display_end_message($in);
+    $in->exit(0);
+}
+
+sub umount_all {
+    my ($fstab) = @_;
+    #- make sure nothing is mounted in the new root
+    foreach (sort { $b cmp $a } grep { /^$::prefix/ } map { (split)[1] } cat_('/proc/mounts')) {
+        system('umount', $_);
+    }
+    #- make sure selected devices aren't mounted, and swap isn't used
+    foreach (grep { isSwap($_) } @$fstab) {
+        eval { fs::mount::swapoff($_->{device}) };
+    }
+    foreach (map { $_->{mntpoint} && !isSwap($_) ? "/dev/$_->{device}" : () } @$fstab) {
+        system('umount', $_);
+    }
+}
+
+sub on_reboot_needed {
+    my ($in) = @_;
+    fs::partitioning_wizard::warn_reboot_needed($in);
+    $in->exit(0);
+}
+
+sub display_start_message() {
+    require any;
+    my $has_running_wm = to_bool(any::running_window_manager());
+    local $::isStandalone = $has_running_wm; # center me if run in xsetup.d script
+    my $w = ugtk2->new(N("Draklive-Install"));
+    ugtk2::gtkadd($w->{window},
+                  ugtk2::gtkcreate_img("pclinuxos-wizard-cs"),
+                  ugtk2::gtknew('Label', height => 5),
+                  N("Tento průvodce vám pomůže nainstalovat PCLinuxOS do vašeho počítače."),
+                  ugtk2::create_okcancel($w));
+    $w->{ok}->grab_focus;
+    $w->main;
+}
+
+sub umount_first_pass() {
+    local $::prefix = undef;
+    my $all_hds = fsedit::get_hds();
+    fs::get_raw_hds('', $all_hds);
+    fs::get_info_from_fstab($all_hds);
+    my $fstab = [ fs::get::fstab($all_hds) ];
+    fs::merge_info_from_mtab($fstab);
+
+    #- inlined from fs::mount::umount_all to go on when one umount fail
+    #- (maybe the sort function could be shared)
+    log::l("odpojuji všechny oddíly");
+    foreach (sort { $b->{mntpoint} cmp $a->{mntpoint} } 
+	       grep { $_->{mntpoint} && !$_->{real_mntpoint} } @$fstab) {
+	eval { fs::mount::umount_part($_) };
+	log::l("chyba odpojení $_->{mntpoint}: $@") if $@;
+    }
+}
+
+sub init_hds {
+    my ($in, $all_hds, $fstab, $live_media) = @_;
+    my $wait = $in->wait_message('', N("Prosím čekejte"));
+    umount_first_pass();
+    eval { fs::any::get_hds($all_hds, $fstab, [], {}, 'skip_mtab', $in) };
+
+    #- fs::any::get_hds does not return mounts that are not in fstab
+    my @mounted = fs::read_fstab('', '/proc/mounts');
+    my $live_part = find { $_->{mntpoint} eq $live_media } @mounted;
+    my $live_device = $live_part && $live_part->{device};
+    #- remove live device from the detected hds, so that bootloader is not installed on it:
+    #-  bootloader installation uses first device from detect_devices::get, which tries to list devices
+    #-  by booting order, and our live system is likely to be here in first position
+    #- it can be either a partition (USB) or the full disk (Hybrid on USB)
+    @{$all_hds->{hds}} = grep {
+        $_->{device} ne $live_device &&
+        !member($live_device, map { $_->{device} } partition_table::get_normal_parts_and_holes($_));
+    } @{$all_hds->{hds}} if $live_device;
+
+    my $err = $@;
+    umount_all($fstab);
+    if ($err) {
+        undef $wait;
+        $in->ask_warn(N("Chyba"), [ formatError($err) ]);
+        $in->exit(1);
+    }
+}
+
+sub ask_partitions_loop {
+    my ($in, $all_hds, $fstab, $copy_source) = @_;
+
+    while (1) {
+        eval { ask_partitions($in, $all_hds, $fstab, $copy_source) };
+        my $err = $@ or last;
+        $in->exit(1) if $err =~ /wizcancel/ ||
+          !$in->ask_warn(N("Chyba"), [ N("Došlo k chybě"), formatError($err) ]);
+    }
+}
+
+sub ask_partitions {
+    my ($in, $all_hds, $fstab, $copy_source) = @_;
+    fs::partitioning_wizard::main($in, $all_hds, $fstab, [], undef, {}, 'skip_mtab');
+
+    mkdir_p($::prefix) or die "není možné vytvořit $::prefix";
+
+    fs::any::write_hds($all_hds, $fstab, undef, sub { on_reboot_needed($in) }, {});
+    fs::any::check_hds_boot_and_root($all_hds, $fstab);
+    fs::partitioning::choose_partitions_to_format($in, $fstab);
+
+    my $total = get_total_size($in, $copy_source);
+    my $available = fs::any::getAvailableSpace($fstab, 'skip_mounted');
+    die N("Není k dispozici dostatek místa (%s k dispozici %s je potřeba)",
+          formatXiB($available), formatXiB($total)) . "\n"
+      if $total > $available;
+
+{
+    my $w = ugtk2->new($title);
+    ugtk2::gtkadd($w->{window},
+                  ugtk2::gtkcreate_img("pclinuxos-format-cs"),
+                  ugtk2::gtknew('Label', height => 5),
+                  N("Pro formátování vybraných oddílů stiskněte Další, Zrušit pro ukončení"),
+                  ugtk2::create_okcancel($w));
+    $w->{ok}->grab_focus;
+    $w->main;
+}
+
+    umount_all($fstab);
+    fs::partitioning::format_mount_partitions($in, $all_hds, $fstab);
+}
+
+
+sub prepare_root {
+    my ($in, $all_hds) = @_;
+    #- create required directories and devices (early to have a consistent root before calling other programs)
+    my $_wait = $in->wait_message('', N("Prosím čekejte"));
+    fs::any::prepare_minimal_root($all_hds);
+    run_program::run('makedev', $::prefix . '/dev');
+}
+
+sub build_copy_command {
+    my ($source, $dest) = @_;
+    join(' ',
+         'tar', 'c', '--exclude=/mnt', '--exclude=/live', '--exclude=/proc', '--exclude=/dev', '--exclude=/sys', '--one-file-system', '-C', $source, '.',
+         '|', 
+         'tar', 'xvv', '-C', $dest,
+     );
+}
+
+sub get_total_size {
+    my ($in, $source) = @_;
+    state %total;
+    return $total{$source} if $total{$source};
+    my $_wait = $in->wait_message('', N("Ověřuji dostupné místo"));
+    $total{$source} = first(split(/\s+/, `du -sbx $source 2>/dev/null`));
+}
+
+sub sync_logs() {
+    cp_af('/var/log', $::prefix . '/var');
+}
+
+sub copy_root {
+    my ($in, $copy_source) = @_;
+    my $total = get_total_size($in, $copy_source);
+
+    my ($wait, $update_progress) = copying_message_with_progress_bar($in, N("Probíhá kopírování"));
+    open(my $OUTPUT, '-|', build_copy_command($copy_source, $::prefix));
+    {
+        local $_;
+        my $current = my $previous = 0;
+        while (<$OUTPUT>) {
+            (undef, undef, my $size) = split;
+            $current += $size;
+            if ($current <= $total && $current/$total > $previous/$total + 0.001) {
+                $update_progress->('', $current, $total);
+                $previous = $current;
+            }
+        }
+    }
+    if (!close($OUTPUT)) {
+        undef $wait;
+        undef $update_progress;
+        $in->ask_warn(N("Chyba"), N("Nemohu kopírovat data do nového kořenového adresáře"));
+        $in->exit(1);
+    }
+    sync_logs();
+}
+
+sub clean_harddrake_hds {
+    my ($prefix) = @_;
+    #- remove harddisks from harddrake's config file, so that hardddisks
+    #- are automatically rediscovered at first boot
+    require Storable;
+    my $harddrake_file = $prefix . "/etc/sysconfig/harddrake2/previous_hw";
+    my $harddrake_conf = eval { Storable::retrieve($harddrake_file) };
+    if ($harddrake_conf) {
+        delete $harddrake_conf->{HARDDISK};
+        Storable::store($harddrake_conf, $harddrake_file);
+    }
+}
+
+
+sub complete_install {
+    my ($in, $all_hds) = @_;
+    my $_wait = $in->wait_message('', N("Prosím čekejte"));
+
+    my $real_rpm_dir = "/tmp/rpm/real";
+    cp_f(glob($real_rpm_dir . "/*"), $::prefix . "/var/lib/rpm") if -d $real_rpm_dir;
+
+    {
+        #- do not allow update-menus to create home directory with invalid perms
+        local $ENV{HOME} = '/root';
+        system('chroot', $::prefix, 'rpm', '-e', 'draklive-install');
+        system('chroot', $::prefix, 'rpm', '-e', 'kde4-logininfo');
+    }
+
+     #- unselect live user in kdm
+    my $kdm_cfg = '/usr/share/config/kdm/kdmrc';
+    update_gnomekderc($::prefix . $kdm_cfg,
+    'X-:0-Core' => (AutoLoginEnable => 'false', AutoLoginUser => '')) if -f $kdm_cfg;
+    any::set_autologin($in->do_pkgs, undef);
+
+    #- allow to install doc in disk install
+    substInFile { undef $_ if /^\%_excludedocs/ } $::prefix . '/etc/rpm/macros';
+
+    fs::write_fstab($all_hds, $::prefix);
+
+    clean_harddrake_hds($::prefix);
+
+    # enable back some disabled services
+    require services;
+    services::start_service_on_boot($_) foreach qw(atd crond syslog kheader xinetd cups);
+    sync_logs();
+}
+
+sub setup_bootloader {
+    my ($in, $all_hds, $fstab) = @_;
+    use bootloader;
+    my $bootloader = {};
+    any::setupBootloaderBeforeStandalone($in->do_pkgs, $bootloader, $all_hds, $fstab);
+    local $::Wizard_no_previous = 0;
+    any::setupBootloaderUntilInstalled($in, $bootloader, $all_hds, $fstab, $ENV{SECURE_LEVEL});
+    sync_logs();
+}
+
+sub clean_live_system_hds() {
+    #- clean fstab and harddrake config in the live system
+    #- since partitions UUIDs of the installed system have been modified
+    #- (useful for persistent live systems)
+    local $::prefix = undef;
+    clean_harddrake_hds($::prefix);
+    my $all_hds = fs::get::empty_all_hds(); #- skip real harddisks
+    fs::get_raw_hds('', $all_hds);
+    fs::get_info_from_fstab($all_hds);
+    fs::write_fstab($all_hds, $::prefix);
+}
+
+sub finish_installation {
+    my ($fstab) = @_;
+    sync_logs();
+    #- cleanly umount here, it will avoid fs journals to be corrupted after a hackish reboot
+     
+
+#Get Kernel Information
+my $kernelver = qx(uname -r);
+chomp($kernelver);
+my $kernel = "/boot/vmlinuz-".$kernelver;
+my $initrd = "/boot/initrd-".$kernelver.".img";
+my $with = '';
+
+
+#Establish chroot environment
+system("mount -t none /dev $::prefix/dev -o bind");
+
+# Remove old initrd 
+system("chroot $::prefix rm -f $initrd");
+
+# Make new initrd
+system("chroot $::prefix /sbin/mkinitrd $usbcrap $with $initrd $kernelver");
+
+# Regenerate bootsplash for initrd
+system("chroot $::prefix /usr/share/bootsplash/scripts/make-boot-splash $initrd 800x600");
+
+
+# re-establish original inittab otherwise system wont boot in read/write mode
+system("cp -a /initrd/etc/inittab $::prefix/etc/");
+
+# Touch halt file
+system("chroot $::prefix touch halt");
+
+# PCLOS revert changes made by rc.sysinit on installed system
+system("mv -f $::prefix/etc/rc.d/init.d/halt.livecd $::prefix/etc/rc.d/init.d/halt");
+system("mv -f $::prefix/etc/rc.d/init.d/netfs.livecd $::prefix/etc/rc.d/init.d/netfs");
+system("mv -f $::prefix/etc/sysconfig/network.livecd $::prefix/etc/sysconfig/network") if (-e "$::prefix/etc/sysconfig/network.livecd");
+system("rm -f $::prefix/etc/sysconfig/network-scripts/ifcfg-eth*.livecd");
+system("mkdir -p $::prefix/media");
+system("chmod 777 $::prefix/tmp");
+system("chmod +t $::prefix/tmp");
+
+# PCLinuxOS Specific
+system("echo -e 'none /dev/pts devpts defaults 0 0' >>$::prefix/etc/fstab");
+#system("echo -e 'tmpfs /dev/shm tmpfs defaults 0 0' >>$::prefix/etc/fstab");
+
+# Automatically delete the guest account on first boot
+system("chroot $::prefix touch /etc/delete-guest-account");
+
+# Save alsa sound
+system("chroot $::prefix /sbin/alsactl --ignore store");
+
+# Remove speedboot file
+system("chroot $::prefix rm -rf /var/lib/speedboot/status");
+
+#- copy sysconfig files for first boot
+system("cp -f $::prefix/etc/draklive-install.d/sysconfig/* $::prefix/etc/sysconfig");
+
+#umount it
+system("umount $::prefix/dev");
+
+    umount_all($fstab);
+    clean_live_system_hds();
+}
+
+sub display_end_message {
+    my ($in) = @_;
+    $::Wizard_finished = 1;
+    $in->ask_okcancel(N("Gratulujeme"), N("Instalace byla dokončena. Klikněte na tlačítko 'Dokončit' a restartujte počítač."));
+}
+
+###
+### duplicate code
+###
+
+#- from disdrake::interactive
+{
+    package diskdrake::interactive;
+  sub diskdrake_interactive_Done {
+    my ($in, $all_hds) = @_;
+    eval { raid::verify($all_hds->{raids}) };
+    if (my $err = $@) {
+	$::expert or die;
+	$in->ask_okcancel('', [ formatError($err), N("Přesto pokračovat?") ]) or return;
+    }
+    foreach (@{$all_hds->{hds}}) {
+	if (!write_partitions($in, $_, 'skip_check_rebootNeeded')) {
+	    return if !$::isStandalone;
+	    $in->ask_yesorno(N("Ukončit bez uložení"), N("Ukončit bez uložení tabulky na diskový oddíl?"), 1) or return;
+	}
+    }
+    #- skip that fstab/reboot steps
+    if (!$::isInstall && 0) { 
+	my $new = fs::fstab_to_string($all_hds);
+	if ($new ne $all_hds->{current_fstab} && $in->ask_yesorno('', N("Chcete uložit změny do /etc/fstab?"), 1)) {
+	    $all_hds->{current_fstab} = $new;
+	    fs::write_fstab($all_hds);
+	}
+	update_bootloader_for_renumbered_partitions($in, $all_hds);
+
+	if (any { $_->{rebootNeeded} } @{$all_hds->{hds}}) {
+	    $in->ask_warn('', N("Musíte restartovat počítač, aby byly provedeny změny v nastavení oddílů."));
+	    tell_wm_and_reboot();
+	}
+    }
+    if (my $part = find { $_->{mntpoint} && !maybeFormatted($_) } fs::get::fstab($all_hds)) {
+	$in->ask_okcancel('', N("Měl by jste zformátovat oddíl %s.
+jinak nebude žádný oddíl %s zapsán do fstab.
+Quit anyway?", $part->{device}, $part->{mntpoint})) or return if $::isStandalone && 0; #- no, please
+    }
+    1;
+  }
+}
+
+# forked from interactive::wait_message
+sub copying_message {
+    my ($o, $title, $message, $b_temp) = @_;
+
+    my $w = $o->wait_messageW($title, N("Probíhá kopírování"), ugtk2::gtknew('VBox', padding => 5, children_tight => [
+        ugtk2::gtkcreate_img("pclinuxos-install-cs"),
+        $message,
+    ]));
+    push @tempory::objects, $w if $b_temp;
+    my $b = before_leaving { $o->wait_message_endW($w) };
+
+    #- enable access through set
+    MDK::Common::Func::add_f4before_leaving(sub { $o->wait_message_nextW($_[1], $w) }, $b, 'set');
+    $b;
+}
+
+# forked from interactive::gtk::wait_message_with_progress_bar
+sub copying_message_with_progress_bar {
+    my ($in, $o_title) = @_;
+
+    my $progress = Gtk2::ProgressBar->new;
+    my $w = copying_message($in, $o_title, $progress);
+    my $displayed;
+    $progress->signal_connect(expose_event => sub { $displayed = 1; 0 });
+    $w, sub {
+	my ($msg, $current, $total) = @_;
+	if ($msg) {
+	    $w->set($msg);
+	}
+
+	if ($total) {
+	    $progress or internal_error('You must first give some text to display');
+	    $progress->set_fraction($current / $total);
+	    $progress->show;
+	    $displayed = 0;
+	    mygtk2::flush() while !$displayed;
+	} else {
+	    $progress->hide if !$total;
+	}
+    };
+}
